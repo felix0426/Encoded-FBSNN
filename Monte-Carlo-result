@@ -1,0 +1,340 @@
+import numpy as np
+import torch
+import time
+import os
+
+def compute_exact_solution_hjb(t, X, T, MC_samples=100000):
+    """
+    计算HJB方程的精确解（蒙特卡洛方法）
+    """
+    def g(X):  # MC x NC x D
+        return np.log(0.5 + 0.5 * np.sum(X ** 2, axis=2, keepdims=True))  # MC x N x 1
+
+    def u_exact(t, X):  # NC x 1, NC x D
+        MC = MC_samples
+        NC = t.shape[0]
+        D = X.shape[1]
+
+        W = np.random.normal(size=(MC, NC, D))  # MC x NC x D
+        sqrt_term = np.sqrt(2.0 * np.abs(T - t))  # NC x 1
+
+        # 计算期望
+        X_expanded = X[np.newaxis, :, :]  # 1 x NC x D
+        W_scaled = sqrt_term[np.newaxis, :, :] * W  # MC x NC x 1 * MC x NC x D = MC x NC x D
+        argument = X_expanded + W_scaled  # MC x NC x D
+
+        return -np.log(np.mean(np.exp(-g(argument)), axis=0))  # NC x 1
+
+    return u_exact(t, X)
+
+def generate_identical_trajectories(D=100, N=50, T=1.0, total_all=6000):
+    """
+    生成与原代码完全相同的轨道
+    使用相同的随机种子和生成逻辑
+    """
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+
+    # 使用与原代码相同的随机种子
+    torch.manual_seed(42)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(42)
+    np.random.seed(42)
+
+    dt = T / N
+
+    # 时间增量和布朗运动增量
+    Dt = torch.zeros(total_all, N + 1, 1, device=device)
+    Dt[:, 1:, :] = dt
+
+    DW = torch.zeros(total_all, N + 1, D, device=device)
+    DW[:, 1:, :] = np.sqrt(dt) * torch.randn(total_all, N, D, device=device)
+
+    # 累积得到时间和布朗运动路径
+    fixed_t = torch.cumsum(Dt, dim=1)  # total_all x (N+1) x 1
+    fixed_W = torch.cumsum(DW, dim=1)  # total_all x (N+1) x D
+
+    # 初始点
+    Xi = torch.zeros([1, D], device=device)
+
+    return fixed_t, fixed_W, Xi
+
+def simulate_X_path_identical(t_single, W_single, Xi, N=50, D=100, T=1.0):
+    """
+    模拟单条X路径
+    """
+    batch_size = 1
+
+    # 转换为numpy
+    t_np = t_single.cpu().numpy()
+    W_np = W_single.cpu().numpy()
+    Xi_np = Xi.cpu().numpy()
+
+    X_list = []
+
+    # 初始时刻 - 与原代码predict函数相同
+    t0 = t_np[:, 0, :]  # 1 x 1
+    W0 = W_np[:, 0, :]  # 1 x D
+    X0 = Xi_np  # 1 x D
+
+    X_list.append(X0)
+
+    # 时间迭代
+    for n in range(N):
+        t1 = t_np[:, n + 1, :]  # 1 x 1
+        W1 = W_np[:, n + 1, :]  # 1 x D
+
+        # HJB方程的mu和sigma
+        mu = np.zeros((batch_size, D))  # batch_size x D
+        sigma = np.sqrt(2.0) * np.eye(D)[np.newaxis, :, :]  # batch_size x D x D
+
+        # 计算随机积分项
+        dW = W1 - W0  # batch_size x D
+        sigma_dW = np.matmul(sigma, dW[:, :, np.newaxis]).squeeze(-1)  # batch_size x D
+
+        X1 = X0 + mu * (t1 - t0) + sigma_dW  # batch_size x D
+
+        # 更新变量
+        t0, W0, X0 = t1, W1, X1
+        X_list.append(X0)
+
+    # 堆叠X路径
+    X_path = np.stack(X_list, axis=1)  # 1 x (N+1) x D
+
+    return X_path
+
+def precompute_identical_6000(D=100, N=50, T=1.0, total_train=5000, total_test=1000, mc_samples=100000):
+    """
+    预计算与原代码完全相同的6000条轨道（5000训练+1000测试）
+    """
+    print("=" * 80)
+    print("预计算与原代码完全相同的6000条轨道")
+    print("=" * 80)
+    print(f"参数配置:")
+    print(f"  维度 D = {D}")
+    print(f"  时间步数 N = {N}")
+    print(f"  终端时间 T = {T:.2f}")
+    print(f"  训练轨道总数: {total_train}")
+    print(f"  测试轨道总数: {total_test}")
+    print(f"  总轨道数: {total_train + total_test}")
+    print(f"  蒙特卡洛样本数 = {mc_samples:,}")
+    print(f"  随机种子: 42")
+    print("-" * 80)
+
+    # 步骤1: 生成与原代码完全相同的所有轨道
+    print("\n1. 生成与原代码完全相同的轨道...")
+    start_time = time.time()
+
+    total_all = total_train + total_test
+    fixed_t, fixed_W, Xi = generate_identical_trajectories(D, N, T, total_all)
+
+    gen_time = time.time() - start_time
+    print(f"  轨道生成完成，用时: {gen_time:.2f}秒")
+    print(f"  总轨道数: {total_all} (训练: {total_train}, 测试: {total_test})")
+    print(f"  时间路径形状: {fixed_t.shape}")
+    print(f"  布朗运动路径形状: {fixed_W.shape}")
+
+    # 步骤2: 预计算5000条训练轨道和1000条测试轨道
+    print("\n2. 预计算精确解...")
+
+    # 存储结果
+    train_mc_solutions = np.zeros((total_train, N + 1, 1))  # 5000条训练轨道
+    test_mc_solutions = np.zeros((total_test, N + 1, 1))    # 1000条测试轨道
+
+    # ============ 预计算训练集 (全部5000条) ============
+    print(f"\n  2.1 预计算训练集 (全部{total_train}条轨道)...")
+    train_start = time.time()
+
+    for i in range(total_train):  # 计算全部5000条训练轨道
+        # 获取单条轨道
+        t_single = fixed_t[i:i+1]  # 索引0-4999
+        W_single = fixed_W[i:i+1]
+
+        # 模拟X路径
+        X_path = simulate_X_path_identical(t_single, W_single, Xi, N, D, T)
+
+        # 计算精确解
+        Y_exact = compute_exact_solution_hjb(
+            t_single.cpu().numpy()[0, :, :],  # (N+1, 1)
+            X_path[0, :, :],                  # (N+1, D)
+            T,
+            mc_samples
+        )
+
+        train_mc_solutions[i] = Y_exact
+
+        # 显示进度
+        if (i + 1) % 500 == 0:
+            elapsed = time.time() - train_start
+            avg_time = elapsed / (i + 1)
+            remaining = avg_time * (total_train - i - 1)
+            print(f"    已处理训练轨道 {i + 1}/{total_train}, "
+                  f"用时: {elapsed:.1f}秒, "
+                  f"预计剩余: {remaining:.1f}秒")
+
+    train_time = time.time() - train_start
+
+    # ============ 预计算测试集 (全部1000条) ============
+    print(f"\n  2.2 预计算测试集 (全部{total_test}条轨道)...")
+    test_start = time.time()
+
+    for i in range(total_test):
+        # 获取单条测试轨道
+        idx = total_train + i  # 索引5000-5999
+        t_single = fixed_t[idx:idx+1]
+        W_single = fixed_W[idx:idx+1]
+
+        # 模拟X路径
+        X_path = simulate_X_path_identical(t_single, W_single, Xi, N, D, T)
+
+        # 计算精确解
+        Y_exact = compute_exact_solution_hjb(
+            t_single.cpu().numpy()[0, :, :],
+            X_path[0, :, :],
+            T,
+            mc_samples
+        )
+
+        test_mc_solutions[i] = Y_exact
+
+        # 显示进度
+        if (i + 1) % 100 == 0:
+            elapsed = time.time() - test_start
+            avg_time = elapsed / (i + 1)
+            remaining = avg_time * (total_test - i - 1)
+            print(f"    已处理测试轨道 {i + 1}/{total_test}, "
+                  f"用时: {elapsed:.1f}秒, "
+                  f"预计剩余: {remaining:.1f}秒")
+
+    test_time = time.time() - test_start
+    total_time = time.time() - start_time
+
+    # 步骤3: 验证一致性
+    print("\n3. 验证轨道一致性...")
+
+    # 验证第一条训练轨道的时间路径
+    t_first_train = fixed_t[0].cpu().numpy()[:, 0]
+    expected_t = np.linspace(0, T, N + 1)
+    if np.allclose(t_first_train, expected_t, rtol=1e-10):
+        print("  ✓ 时间路径一致")
+    else:
+        print("  ✗ 时间路径不一致!")
+
+    # 验证轨道数量
+    print(f"  ✓ 训练轨道数: {train_mc_solutions.shape[0]}")
+    print(f"  ✓ 测试轨道数: {test_mc_solutions.shape[0]}")
+
+    # 验证索引范围
+    print(f"  ✓ 训练轨道索引: 0-{total_train-1}")
+    print(f"  ✓ 测试轨道索引: {total_train}-{total_all-1}")
+
+    # 步骤4: 保存结果
+    print("\n4. 保存结果...")
+
+    # 创建保存目录
+    save_dir = "precomputed_6000"
+    os.makedirs(save_dir, exist_ok=True)
+
+    timestamp = time.strftime("%Y%m%d_%H%M%S")
+    filename = f"hjb_identical_6000_D{D}_N{N}_{timestamp}.npz"
+    filepath = os.path.join(save_dir, filename)
+
+    # 保存数据
+    save_dict = {
+        'train_mc_solutions': train_mc_solutions,  # 5000条训练轨道的精确解
+        'test_mc_solutions': test_mc_solutions,    # 1000条测试轨道的精确解
+        'params': {
+            'D': D,
+            'N': N,
+            'T': T,
+            'total_train': total_train,
+            'total_test': total_test,
+            'total_all': total_all,
+            'mc_samples': mc_samples,
+            'random_seed': 42,
+            'train_indices': list(range(total_train)),  # 训练轨道索引
+            'test_indices': list(range(total_train, total_all)),  # 测试轨道索引
+            'computation_time': total_time,
+            'timestamp': timestamp
+        }
+    }
+
+    np.savez_compressed(filepath, **save_dict)
+
+    # 步骤5: 显示统计信息
+    print(f"\n5. 预计算完成!")
+    print(f"总用时: {total_time:.2f}秒")
+    print(f"训练集计算: {train_time:.2f}秒 ({train_time/total_train:.3f}秒/条)")
+    print(f"测试集计算: {test_time:.2f}秒 ({test_time/total_test:.3f}秒/条)")
+    print(f"平均每条轨道: {total_time/total_all:.3f}秒")
+    print(f"\n保存到: {filepath}")
+
+    # 计算文件大小
+    file_size = os.path.getsize(filepath) / 1024 / 1024  # MB
+    print(f"文件大小: {file_size:.2f} MB")
+
+    print(f"\n6. 数据统计:")
+    print(f"训练集精确解形状: {train_mc_solutions.shape}")
+    print(f"测试集精确解形状: {test_mc_solutions.shape}")
+    print(f"训练集精确解范围: [{np.min(train_mc_solutions):.4f}, {np.max(train_mc_solutions):.4f}]")
+    print(f"测试集精确解范围: [{np.min(test_mc_solutions):.4f}, {np.max(test_mc_solutions):.4f}]")
+    print(f"训练集精确解均值: {np.mean(train_mc_solutions):.4f} ± {np.std(train_mc_solutions):.4f}")
+    print(f"测试集精确解均值: {np.mean(test_mc_solutions):.4f} ± {np.std(test_mc_solutions):.4f}")
+
+    return filepath
+
+def load_precomputed_6000_solutions(filepath):
+    """
+    加载预计算的6000条轨道解
+    """
+    if not os.path.exists(filepath):
+        raise FileNotFoundError(f"文件不存在: {filepath}")
+
+    print(f"加载预计算文件: {os.path.basename(filepath)}")
+
+    data = np.load(filepath, allow_pickle=True)
+
+    train_mc_solutions = data['train_mc_solutions']
+    test_mc_solutions = data['test_mc_solutions']
+    params = data['params'].item()
+
+    print(f"加载成功!")
+    print(f"参数: D={params['D']}, N={params['N']}, T={params['T']}")
+    print(f"训练轨道数: {train_mc_solutions.shape[0]}条")
+    print(f"测试轨道数: {test_mc_solutions.shape[0]}条")
+    print(f"总轨道数: {params['total_all']}条")
+    print(f"随机种子: {params['random_seed']}")
+    print(f"计算时间: {params['computation_time']:.1f}秒")
+
+    return train_mc_solutions, test_mc_solutions, params
+
+if __name__ == "__main__":
+    # 使用与原代码完全相同的参数
+    filepath = precompute_identical_6000(
+        D=100,
+        N=50,
+        T=1.0,
+        total_train=5000,
+        total_test=1000,
+        mc_samples=100000
+    )
+
+    print("\n" + "=" * 80)
+    print("预计算完成! 这些轨道与原代码中的轨道完全相同")
+    print("=" * 80)
+    print(f"文件: {filepath}")
+    print(f"训练轨道: 5000条 (索引0-4999)")
+    print(f"测试轨道: 1000条 (索引5000-5999)")
+
+    print("\n验证加载功能...")
+    train_mc_solutions, test_mc_solutions, params = load_precomputed_6000_solutions(filepath)
+
+    print(f"\n示例数据:")
+    print(f"训练轨道0的前5个时间点: {train_mc_solutions[0, :5, 0]}")
+    print(f"测试轨道0的前5个时间点: {test_mc_solutions[0, :5, 0]}")
+
+    print("\n" + "=" * 80)
+    print("预计算完成! 文件已保存到:")
+    print(f"  {filepath}")
+    print("\n在HJB求解器中使用:")
+    print(f"  train_mc, test_mc, params = load_precomputed_6000_solutions('{filepath}')")
+    print("=" * 80)
